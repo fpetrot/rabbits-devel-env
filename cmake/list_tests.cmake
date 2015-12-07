@@ -1,0 +1,17 @@
+function(add_test test)
+	if(NOT IS_ABSOLUTE "${test}")
+		set(test ${CMAKE_CURRENT_LIST_DIR}/${test})
+	endif()
+	message(${test})
+endfunction(add_test)
+
+function(subdirs)
+	foreach(s IN LISTS ARGN)
+		if(NOT IS_ABSOLUTE "${s}")
+			set(s ${CMAKE_CURRENT_LIST_DIR}/${s})
+		endif()
+		include(${s}/CTestTestfile.cmake)
+	endforeach()
+endfunction(subdirs)
+
+subdirs(${CMAKE_CURRENT_SOURCE_DIR}/build)

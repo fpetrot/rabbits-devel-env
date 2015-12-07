@@ -1,0 +1,497 @@
+#!/bin/bash
+#
+# This file is part of Rabbits
+# Copyright (C) 2015  Clement Deschamps and Luc Michel
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+ARG0="$0"
+LIST=repos.list
+
+# Default user command
+DEFAULT="status"
+
+# Build directory
+BUILD="build"
+BASE="$(cd $(dirname $0); pwd)"
+
+_pushd() {
+    pushd "$1" >/dev/null 2>&1
+}
+
+_popd() {
+    popd >/dev/null 2>&1
+}
+
+report_nl() {
+    printf "%b" "$@" >&2
+}
+
+report() {
+    report_nl "$@${C_RESET}\n"
+}
+
+setup_colors() {
+    C_RESET="\033[0m"
+    C_RED="\033[1;31m"
+    C_GREEN="\033[1;32m"
+    C_YELLOW="\033[1;33m"
+    C_BLACK="\033[1;30m"
+    C_BOLD="\033[1m"
+}
+
+add_to_git_exclude() {
+    local exc=$1
+
+    [[ -d "${BASE}"/.git ]] || return 1
+
+    egrep -q "^$1$" "${BASE}"/.git/info/exclude || echo "$1" >>"${BASE}"/.git/info/exclude
+    return 0
+}
+
+git_current_branch() {
+    [[ -d .git ]] || return 1
+
+    git rev-parse --abbrev-ref HEAD || return 1
+}
+
+git_current_remote() {
+    [[ -d .git ]] || return 1
+
+    git config --get branch.$(git_current_branch).remote || return 1
+}
+
+git_branch_exists() {
+    [[ -d .git ]] || return 1
+
+    git rev-parse -q --verify "$1" >/dev/null
+}
+
+git_remote_branch_exists() {
+    [[ -d .git ]] || return 1
+
+    git rev-parse -q --verify "$(git_current_remote)"/"$1" >/dev/null
+}
+
+git_remote_url() {
+    local remote
+
+    [[ -d .git ]] || return 1
+
+    remote=$(git_current_remote) || return 1
+    git config --get remote.${remote}.url | sed -e 's|\(.*\)/.*|\1|'
+
+    return ${PIPESTATUS[0]}
+}
+
+repos_version() {
+    [[ -e VERSION ]] && cat VERSION
+}
+
+
+clone_all() {
+    local r b branch remote
+
+    if [[ "$1""x" != "x" ]]; then
+        remote="$1"
+    else
+        remote=$(git_remote_url) || return 1
+    fi
+
+    while IFS='|' read r b ; do
+        r_raw=${r/.git/}
+
+        if [[ "$b"x != x ]]; then
+            branch="-b $b"
+        else
+            branch=
+        fi
+
+        if [[ ! -d "$r_raw" ]]; then
+            git clone $branch "${remote}"/"$r" || return 1
+            add_to_git_exclude "$r_raw" || return 1
+        fi
+    done
+}
+
+# Returns:
+#  0. clean
+#  1. dirty
+local_status() {
+    git diff-index --quiet HEAD
+}
+
+# Returns:
+#  0. up-to-date
+#  1. local out-of-date
+#  2. fast-forwardable
+#  3. diverged
+remote_status() {
+    local l=$(git rev-parse @)
+    local r=$(git rev-parse @{u})
+    local b=$(git merge-base @ @{u})
+
+    if [[ $l == $r ]] ; then
+        return 0
+    elif [[ $l == $b ]] ; then
+        return 1
+    elif [[ $r == $b ]] ; then
+        return 2
+    else
+        return 3
+    fi
+}
+
+
+print_local_status() {
+    if local_status ; then
+        printf "${C_GREEN}clean${C_RESET}"
+    else
+        printf "${C_RED}dirty${C_RESET}"
+    fi
+}
+
+print_remote_status() {
+    remote_status
+
+    case $? in
+        0) printf "${C_GREEN}up to date${C_RESET}";;
+        1) printf "${C_YELLOW}local out of date${C_RESET}";;
+        2) printf "${C_YELLOW}fast-forwardable${C_RESET}";;
+        3) printf "${C_RED}diverged${C_RESET}";;
+    esac
+}
+
+network_fail() {
+    report "${C_RED}git fetch failed. Check network connectivity."
+    NET_OK=false
+}
+
+fetch() {
+    if $NET_OK; then
+        git fetch --quiet --prune || network_fail
+    fi
+}
+
+_status() {
+    local r=$1
+
+    fetch
+    report "$r\r\t\t$(git_current_branch)\r\t\t\t\t$(repos_version)\r\t\t\t\t\t\t$(print_local_status)\t$(print_remote_status)"
+}
+
+status_all() {
+    local r b
+    NET_OK=true
+
+    report "${C_BLACK}$(printf -- '-%.0s' {1..80})${C_RESET}"
+    report "${C_BOLD}repos\r\t\tbranch\r\t\t\t\tversion\r\t\t\t\t\t\tlocal\tremote${C_RESET}"
+    report "${C_BLACK}$(printf -- '-%.0s' {1..80})${C_RESET}"
+
+    _status "."
+
+    while IFS='|' read r b ; do
+        r_raw=${r/.git/}
+
+        if [[ -d "$r_raw" ]]; then
+            _pushd "$r_raw"
+            _status "$r_raw"
+            _popd
+        else
+            report "$r\r\t\t${C_YELLOW}not cloned${C_RESET}"
+        fi
+    done
+}
+
+pull() {
+    local r=$1
+
+    if ! local_status ; then
+        report "$r\r\t\t${C_RED}not clean, not pulling${C_RESET}"
+        return 1
+    fi
+
+    fetch
+    remote_status
+
+    case $? in
+        0) report "$r\r\t\talready up-to-date";;
+        1) git pull || report "$r\r\t\t${C_RED}pull failed! Repository left in inconsistent state, please check!${C_RESET}";;
+        2) report "$r\r\t\t${C_RED}fast-forwardable, not pulling${C_RESET}";;
+        3) report "$r\r\t\t${C_RED}has diverged, not pulling${C_RESET}";;
+    esac
+}
+
+pull_all() {
+
+    pull .
+
+    while IFS='|' read r b ; do
+        local r_raw=${r/.git/}
+        _pushd "$r_raw"
+        pull "$r_raw"
+        _popd
+    done
+}
+
+checkout() {
+    local r=$1
+    local b=$2
+
+    git_branch_exists "$b" || git_remote_branch_exists "$b" || return 1
+    git checkout -q "$b" || return 2
+}
+
+checkout_all() {
+    local branch=$1
+
+    if [[ "x"$branch == "x" ]]; then
+       usage
+       return 1
+    fi
+
+    while IFS='|' read r b ; do
+        local r_raw=${r/.git/}
+
+        if [[ "x"$b == "x" ]]; then
+            _pushd "$r_raw"
+            checkout "$r_raw" "$branch"
+            _popd
+        fi
+    done
+}
+
+# With CMake external projects, there is no way of passing double-quote escaped
+# value to configure step. For instance, we cannot give --cc="distcc gcc".
+# Thus, this function patches the generated Makefile with CC and CXX env values
+# if they exist.
+fix_sc_qemu_configure() {
+    local makefile="$BASE/$BUILD/CMakeFiles/sc-qemu.dir/build.make"
+
+    [[ ! -r "$makefile" ]] && return 0
+
+    if [[ "x"${CC} != "x" ]]; then
+        sed -i -e 's|--enable-rabbits|& --cc="'"${CC}"'"|' "$makefile"
+    fi
+
+    if [[ "x"${CXX} != "x" ]]; then
+        sed -i -e 's|--enable-rabbits|& --cxx="'"${CXX}"'"|' "$makefile"
+    fi
+}
+
+setup_build() {
+    mkdir -p "$BUILD"
+
+    _pushd "$BUILD"
+
+    ${CMAKE:-cmake} "$BASE" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=1 "$@"
+
+    _popd
+
+    fix_sc_qemu_configure
+}
+
+emit_ci_test_makefile() {
+    local recipe=
+
+    printf 'all: ci-test\n\n'
+
+    printf '.PHONY: ci-test\n'
+    printf 'ci-test: RABBITS_DYNLIB_PATH=$(shell ./repos print-dynlib-path)\n'
+    printf 'export RABBITS_DYNLIB_PATH\n\n'
+
+    for t in $@; do
+        recipe="ci-test-$t"
+        printf 'ci-test: %s\n' "$recipe"
+        printf '.PHONY: %s\n' "$recipe"
+        printf '%s:\n' "$recipe"
+        printf '\t%s\n' "$t"
+        printf '\n'
+    done
+
+}
+
+archive_all() {
+    local archive_list=
+    local tests=
+
+    # Rabbits executable
+    archive_list+="$BUILD"/rabbits/rabbits/rabbits'\n'
+
+    # Dev repo files
+    archive_list+=repos'\n'
+    archive_list+=repos.list'\n'
+    archive_list+=rabbits.sh'\n'
+
+    # Dynlib files
+    archive_list+=$(find "$BUILD" -name "*.so")'\n'
+
+    # Config files and their symlinks
+    archive_list+=$(find config -not -type d)'\n'
+    archive_list+=$(find config -type l -exec realpath --relative-to="$BASE" {} \;)'\n'
+
+    tests=$(list_tests)
+
+    emit_ci_test_makefile "$tests" >Makefile.ci-test
+    archive_list+=Makefile.ci-test'\n'
+
+    archive_list+="$tests"
+
+    printf "$archive_list\n" | xargs tar zcf -
+    rm -f Makefile.ci-test
+}
+
+build_dir() {
+    printf "%s/%s\n" "$BASE" "$BUILD"
+}
+
+print_rabbits_dynlib_path() {
+    local r b
+    local prefix=
+
+    while IFS='|' read r b ; do
+        local r_raw=${r/.git/}
+
+        case "${r_raw}" in
+            "rabbits")
+                continue;;
+            "sc-qemu")
+                printf "%s%s" "$prefix" "$(build_dir)/${r_raw}-prefix/src/${r_raw}-build/arm-softmmu";; # XXX
+            *)
+                printf "%s%s" "$prefix" "$(build_dir)/$r_raw";;
+        esac
+
+        prefix=":"
+    done
+}
+
+print_repos_list() {
+    local prefix=
+    while IFS='|' read r b ; do
+        printf "%s%s" "$prefix" "${r/.git/}"
+        prefix=";"
+    done
+}
+
+create_plat_symlink() {
+    local platform=$1
+    local sym="$BASE"/"${platform}.sh"
+
+    if [ ! -r "$sym" ]; then
+        ln -s rabbits.sh "${sym}"
+        add_to_git_exclude "${platform}.sh"
+    fi
+}
+
+list_tests() {
+    cmake -P cmake/list_tests.cmake |& while read t; do
+        realpath --relative-to="$BASE" "$t"
+    done
+}
+
+_usage() {
+    local arg0=$1
+    local ucmd scmd hmsg
+
+    report "Usage: $arg0 cmd"
+    report
+    report "Available commands:"
+    while IFS='|' read ucmd scmd args opt_args hmsg ; do
+        if [[ -z "$hmsg" ]]; then
+            # Undocumented command
+            continue
+        fi
+
+        local args_str=
+        for i in $(seq 1 ${args}); do
+            args_str+=" <a$i>"
+        done
+
+        if [[ $opt_args == '*' ]]; then
+            args_str+=" [a...]"
+        else
+            for i in $(seq $((1+${args})) $((${args}+${opt_args})) ); do
+                args_str+=" [a$i]"
+            done
+        fi
+
+
+        report "   $ucmd$args_str\r\t\t\t$hmsg"
+    done
+    report
+    report "Default command is \`$DEFAULT' if not specified"
+}
+
+# Commands of this script
+# "user cmd|shell cmd|args|optional args|help message"
+CMDS="clone|clone_all|0|1|Clone not already cloned repositories. Override default clone base URL with [a1] ($(git_remote_url))
+setup|setup_build|0|*|Create the build directory and call cmake. Extra args are passed to cmake
+pull|pull_all|0|0|Pull clean and not up-to-date repositories
+checkout|checkout_all|1|0|Checkout the existing branch <a1> in all repositories (unless one is specified in $LIST)
+status|status_all|0|0|Print a summary of local and remote repositories status
+archive|archive_all|0|0|Create a .tar.gz archive of the current repositories containing necessary files to run rabbits
+help|usage|0|0|This help message"
+
+# Undocumented commands
+CMDS+="
+build-dir|build_dir|0|0|
+repos-list|print_repos_list|0|0|
+print-dynlib-path|print_rabbits_dynlib_path|0|0|
+create-plat-symlink|create_plat_symlink|1|0|
+list-tests|list_tests|0|0|"
+
+
+usage() {
+    _usage "$ARG0" <<<"$CMDS"
+}
+
+parse_args() {
+    local cmd=$1
+    local argc=$#
+
+    if [[ $# -eq 0 ]]; then
+        cmd=$DEFAULT
+        argc=1
+    fi
+
+    while IFS='|' read ucmd scmd args opt_args hmsg; do
+        if [[ "$cmd" == "$ucmd" ]]; then
+            if [[ "$opt_args" != '*' ]] \
+                && ( [[ $argc -lt $(($args+1)) ]] \
+                || [[ $argc -gt $(($args+$opt_args+1)) ]] )
+            then
+                usage
+                return 1
+            fi
+
+            printf '%s' "$scmd"
+            return 0
+        fi
+    done
+
+    usage
+    return 1
+}
+
+
+setup_colors
+
+cmd=$(parse_args "$@" <<<"$CMDS") || exit 1
+
+shift
+
+"${cmd}" "$@" <"$BASE"/$LIST
+
+# vim: ts=4 sw=4 sts=0 expandtab
