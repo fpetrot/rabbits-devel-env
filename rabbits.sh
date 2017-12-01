@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -x
 #
 # This file is part of Rabbits
 # Copyright (C) 2015  Clement Deschamps and Luc Michel
